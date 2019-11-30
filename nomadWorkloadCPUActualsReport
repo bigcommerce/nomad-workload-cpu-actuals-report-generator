@@ -1,0 +1,561 @@
+#!/usr/bin/env groovy
+
+@Grapes([
+    @Grab(group='org.apache.commons', module='commons-math3', version='3.6.1'),
+    @Grab(group='com.hashicorp.nomad', module='nomad-sdk', version='0.10.5.0'),
+    @Grab(group='com.google.guava', module='guava', version='29.0-jre'),
+    @Grab(group='org.apache.poi', module='poi', version='4.1.2'),
+    @Grab(group='org.apache.poi', module='poi-ooxml', version='4.1.2')
+])
+
+import java.awt.Color
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.TimeUnit
+import java.math.BigDecimal
+import java.math.MathContext
+import java.math.RoundingMode
+import groovy.json.JsonSlurper
+import groovy.lang.Delegate
+import groovy.transform.Canonical
+import org.apache.commons.math3.stat.descriptive.DescriptiveStatistics
+import org.apache.poi.ss.usermodel.FillPatternType
+import org.apache.poi.ss.usermodel.IndexedColors
+import org.apache.poi.ss.usermodel.BorderStyle
+import org.apache.poi.xssf.usermodel.XSSFColor
+import org.apache.poi.xssf.usermodel.XSSFWorkbook
+import com.google.common.base.Stopwatch
+import com.google.common.primitives.Doubles
+import com.hashicorp.nomad.javasdk.NomadApiClient
+import com.hashicorp.nomad.javasdk.NomadApiConfiguration
+
+def envReplacement = '%env%'
+def defaultFallbackNomadClock = '2300'
+def defaultSleepTime = '5'
+def defaultNomadTLSCACertFilename = 'nomadca.crt'
+def defaultNomadTLSKeyFilename = "${envReplacement}.nomad.crt"
+def defaultNomadTLSCertFilename = "${envReplacement}.nomad.key"
+def defaultNomadHost = "https://nomad.service.${envReplacement}-dc1.consul:4646"
+def defaultPrometheusHost = "http://prometheus-read.service.${envReplacement}-dc1.consul:9090"
+
+def listConverter = { input ->
+  input.split(',')
+}
+
+def cli = new CliBuilder(header: 'Nomad Workload CPU Actuals Report', usage:'./nomadWorkloadCPUActualsReport -e <comma delimited environments> <other args>', width: -1, footer: "Environment queries are run in parallel to reduce report generation time. Use ${envReplacement} to inject environment into --nomadTLSKeyFilename, --nomadTLSCertFilename, --nomadHost, --prometheusHost")
+cli.nca(longOpt: 'nomadTLSCACertFilename', "Nomad TLS CA Certificate Filename [defaults to ${defaultNomadTLSCACertFilename}]", args: 1, defaultValue: defaultNomadTLSCACertFilename)
+cli.nk(longOpt: 'nomadTLSKeyFilename', "Nomad TLS Certificate Filename [defaults to ${defaultNomadTLSKeyFilename}]", args: 1, defaultValue: defaultNomadTLSKeyFilename)
+cli.nc(longOpt: 'nomadTLSCertFilename', "Nomad TLS Key Filename [defaults to ${defaultNomadTLSCertFilename}]", args: 1, defaultValue: defaultNomadTLSCertFilename)
+cli.h(longOpt: 'help', 'Usage Information')
+cli.fbc(longOpt: 'nomadFallbackClock', args:1, "The approximate clockspeed of out-of-service Nomad nodes that were used to run historical workloads tracked in Prometheus [defaults to ${defaultFallbackNomadClock}]", defaultValue: defaultFallbackNomadClock, type: Integer)
+cli.avg(longOpt: 'avgKnownNomadClients', 'Use instead of --nomadFallbackClock to average the known Nomad clients for historical workloads')
+cli.e(longOpt: 'environments', 'Environments (comma delimited)', args: 1, required: true, convert: listConverter)
+cli.d1h(longOpt: 'disableOneHourQuery', 'Disable 1 hour query')
+cli.d1d(longOpt: 'disableOneDayQuery', 'Disable 1 day query')
+cli.d7d(longOpt: 'disableSevenDayQuery', 'Disable 7 day query')
+cli.d30d(longOpt: 'disableThirtyDayQuery', 'Disable 30 day query')
+cli.e60d(longOpt: 'enableSixytDayQuery', 'Enable 60 day query')
+cli.e90d(longOpt: 'enableNinetyDayQuery', 'Enable 90 day query')
+cli.jobs(longOpt: 'targetJobs', 'Target specific jobs (comma delimited)', args: 1, convert: listConverter)
+cli.adstats(longOpt: 'advancedStats', 'Writes advanced stats including Std Dev, Kurtosis, and Skewness')
+cli.miss(longOpt: 'includeMissRate', 'Write the miss rate')
+cli.qst(longOpt: 'querySleepTime', args: 1, "Query sleep time in seconds [defaults to ${defaultSleepTime}]", type: Long, defaultValue: defaultSleepTime)
+cli.jst(longOpt: 'taskSleepTime', args: 1, "Task sleep time in seconds [defaults to ${defaultSleepTime}]", type: Long, defaultValue: defaultSleepTime)
+cli.nh(longOpt: 'nomadHost', args: 1, "Nomad host [defaults to ${defaultNomadHost}]", defaultValue: defaultNomadHost)
+cli.ph(longOpt: 'prometheusHost', args: 1, "Prometheus host [defaults to ${defaultPrometheusHost}]", defaultValue: defaultPrometheusHost)
+
+def cliOptions = cli.parse(args)
+
+// if error in cli parsing or missing values, exit
+if (!cliOptions) {
+  System.exit(-1)
+}
+
+// if the user requested help menu, display usage and exit
+if (cliOptions.help) {
+  cli.usage()
+  System.exit(0)
+}
+
+def printErr = System.err.&println
+
+// timers and dates for file output
+def totalTimeStopwatch = new Stopwatch().start()
+def startTime = LocalDateTime.now()
+
+// environments to scrutinize
+def envs = cliOptions.environments
+println "Processing for environments: ${envs}"
+
+// various wait, timeouts, etc...
+def perTaskQuerySleepTime = TimeUnit.SECONDS.toMillis(cliOptions.querySleepTime)
+def perTaskSleepTime = TimeUnit.SECONDS.toMillis(cliOptions.taskSleepTime)
+
+def mathContext = new MathContext(14)
+
+// header values used for each sheet in the excel doc
+def perQueryWindowMetrics = ['Mean MHz', 'p50 MHz', 'p95 MHz ', 'p99 MHz', 'Max MHz']
+
+if (cliOptions.includeMissRate) {
+  perQueryWindowMetrics = ['Miss Rate'].addAll(perQueryWindowMetrics)
+}
+
+if (cliOptions.advancedStats) {
+  perQueryWindowMetrics.addAll(['MHz Std Dev', 'MHz Kurtosis', 'MHz Skewness'])
+}
+
+perQueryWindowMetrics.addAll(['Mean Memory', 'p50 Memory', 'p95 Memory ', 'p99 Memory', 'Max Memory'])
+
+def headerValues = ['Team', 'Job', 'Task Group', 'Slack Channel', 'CPU Hard Limit', 'Allocated MHz', 'Allocated Memory', 'Container Count']
+
+if (!cliOptions.disableOneHourQuery) headerValues.addAll(perQueryWindowMetrics.collect { metric -> "1 Hr ${metric}" })
+if (!cliOptions.disableOneDayQuery) headerValues.addAll(perQueryWindowMetrics.collect { metric -> "1 Day ${metric}" })
+if (!cliOptions.disableSevenDayQuery) headerValues.addAll(perQueryWindowMetrics.collect { metric -> "7 Day ${metric}" })
+if (!cliOptions.disableThirtyDayQuery) headerValues.addAll(perQueryWindowMetrics.collect { metric -> "30 Day ${metric}" })
+if (cliOptions.enableSixytDayQuery) headerValues.addAll(perQueryWindowMetrics.collect { metric -> "60 Day ${metric}" })
+if (cliOptions.enableNinetyDayQuery) headerValues.addAll(perQueryWindowMetrics.collect { metric -> "90 Day ${metric}" })
+
+// workbook for excel doc, font for header
+def workbook = new XSSFWorkbook()
+def headerFont = workbook.createFont()
+headerFont.setBold(true)
+def headerCellStyle = workbook.createCellStyle()
+headerCellStyle.setFont(headerFont)
+headerCellStyle.setBorderBottom(BorderStyle.THIN)
+
+
+// colors to use for sheet highlighting
+def orange = Color.ORANGE
+def orangeHue = Color.RGBtoHSB(orange.red, orange.green, orange.blue, null)[0]
+def green = Color.GREEN
+def greenHue = Color.RGBtoHSB(green.red, green.green, green.blue, null)[0]
+
+// closure that colors a cell based on how far the cell value is from the expected
+def styleCell = { allocated, actual, borderStyle ->
+
+  def color
+
+  // eq values are colorless, overages are graident orange, overages over 2x are solid red, underutilizations are gradient green
+  if (allocated == actual) {
+    color = Color.WHITE
+  } else if (allocated > actual) {
+    color = Color.getHSBColor(greenHue, (1 - actual / allocated).floatValue(), 1f)
+  } else {
+
+    def actualExceedingAllocated = (actual / allocated - 1).floatValue()
+
+    if (actualExceedingAllocated >= 1.0f) {
+      color = Color.RED
+    } else {
+      color = Color.getHSBColor(orangeHue, actualExceedingAllocated, 1f)
+    }
+  }
+
+  def xssfColor = new XSSFColor(color, workbook.getStylesSource().getIndexedColors())
+
+  def style = workbook.createCellStyle()
+  style.setBorderRight(borderStyle)
+  style.setFillForegroundColor(xssfColor)
+  style.setFillPattern(FillPatternType.SOLID_FOREGROUND)
+
+  style
+}
+
+// takes a pre-created poi row and adds cells for the stats results
+def addValuesToRow = { row, allocated, stats, allocatedMemory ->
+
+  if (cliOptions.includeMissRate) {
+    def missRateCell = row.createCell(row.getLastCellNum())
+    missRateCell.setCellValue("% ${stats.getMissRate()}")
+  }
+
+  def meanCell = row.createCell(row.getLastCellNum())
+  def mean = stats.mean as Integer
+  meanCell.setCellValue(mean)
+  meanCell.setCellStyle(styleCell(allocated, mean, BorderStyle.NONE))
+
+  def p50Cell = row.createCell(row.getLastCellNum())
+  def p50 = stats.getPercentile(50.0) as Integer
+  p50Cell.setCellValue(p50)
+  p50Cell.setCellStyle(styleCell(allocated, p50, BorderStyle.NONE))
+
+  def p95Cell = row.createCell(row.getLastCellNum())
+  def p95 = stats.getPercentile(95.0) as Integer
+  p95Cell.setCellValue(p95)
+  p95Cell.setCellStyle(styleCell(allocated, p95, BorderStyle.NONE))
+
+  def p99Cell = row.createCell(row.getLastCellNum())
+  def p99 = stats.getPercentile(99.0) as Integer
+  p99Cell.setCellValue(p99)
+  p99Cell.setCellStyle(styleCell(allocated, p99, BorderStyle.NONE))
+
+  def maxCell = row.createCell(row.getLastCellNum())
+  def max = stats.max as Integer
+  maxCell.setCellValue(max)
+
+  if (cliOptions.advancedStats) {
+
+    maxCell.setCellStyle(styleCell(allocated, max, BorderStyle.NONE))
+
+    row.createCell(row.getLastCellNum()).setCellValue(stats.standardDeviation as Integer)
+    row.createCell(row.getLastCellNum()).setCellValue(stats.kurtosis as Integer)
+    def skewnessCell = row.createCell(row.getLastCellNum())
+    skewnessCell.setCellValue(stats.skewness as Integer)
+    skewnessCell.setCellStyle(workbook.createCellStyle().setBorderRight(BorderStyle.THIN))
+  } else {
+    maxCell.setCellStyle(styleCell(allocated, max, BorderStyle.THIN))
+  }
+
+  def meanMemoryCell = row.createCell(row.getLastCellNum())
+  def meanMemory = stats.memoryStats.mean as Integer
+  meanMemoryCell.setCellValue(meanMemory)
+  meanMemoryCell.setCellStyle(styleCell(allocatedMemory, meanMemory, BorderStyle.NONE))
+
+  def p50MemoryCell = row.createCell(row.getLastCellNum())
+  def p50Memory = stats.memoryStats.getPercentile(50.0) as Integer
+  p50MemoryCell.setCellValue(p50Memory)
+  p50MemoryCell.setCellStyle(styleCell(allocatedMemory, p50Memory, BorderStyle.NONE))
+
+  def p95MemoryCell = row.createCell(row.getLastCellNum())
+  def p95Memory = stats.memoryStats.getPercentile(95.0) as Integer
+  p95MemoryCell.setCellValue(p95Memory)
+  p95MemoryCell.setCellStyle(styleCell(allocatedMemory, p95Memory, BorderStyle.NONE))
+
+  def p99MemoryCell = row.createCell(row.getLastCellNum())
+  def p99Memory = stats.memoryStats.getPercentile(99.0) as Integer
+  p99MemoryCell.setCellValue(p99Memory)
+  p99MemoryCell.setCellStyle(styleCell(allocatedMemory, p99Memory, BorderStyle.NONE))
+
+  def maxMemoryCell = row.createCell(row.getLastCellNum())
+  def maxMemory = stats.memoryStats.max as Integer
+  maxMemoryCell.setCellValue(maxMemory)
+  maxMemoryCell.setCellStyle(styleCell(allocatedMemory, maxMemory, BorderStyle.THICK))
+}
+
+// concurrent structures for faster processing
+def queue = new ConcurrentLinkedQueue()
+def latch = new CountDownLatch(envs.size())
+
+@Canonical class StatsWithMissData {
+
+  static def mathContext = new MathContext(2, RoundingMode.HALF_UP)
+
+  @Delegate DescriptiveStatistics stats
+  def totalResults
+  def missResults
+  DescriptiveStatistics memoryStats
+  def totalMemoryResults
+
+  BigDecimal getMissRate() {
+    if (totalResults) {
+      def missResults = new BigDecimal(missResults, mathContext)
+      def missRate = missResults.divide(new BigDecimal(totalResults, mathContext), mathContext)
+      missRate.movePointRight(2)
+    } else {
+      BigDecimal.ZERO
+    }
+  }
+}
+
+// class that allows for data movement through processing threads to background thread
+@Canonical class ContainerStats {
+
+  def environment
+  def team
+  def job
+  def taskGroup
+  def slackChannel
+  def cpuHardLimit
+  def allocatedMHz
+  def allocatedMemory
+  def count
+  def hourStats
+  def dayStats
+  def weekStats
+  def monthStats
+  def sixyDayStats
+  def quarterYearStats
+}
+
+// returns meta data about a Task, TaskGroup
+@Canonical class ContainerMeta {
+
+  def slackChannel
+  def team
+  def cpuHardLimit
+}
+
+// loop through environments, start threads
+envs.each { environment ->
+
+  Thread.start {
+
+    try {
+
+      def perEnvironmentStopwatch = new Stopwatch().start()
+      println "Beginning to gather data for ${environment}..."
+
+      def prometheusHost = cliOptions.prometheusHost.replaceAll(envReplacement, environment)
+
+      def nomadConfig = new NomadApiConfiguration.Builder()
+        .setAddress(cliOptions.nomadHost.replaceAll(envReplacement, environment))
+        .setTlsCaFile(cliOptions.nomadTLSCACertFilename)
+        .setTlsSkipVerify(false)
+        .setTlsCertAndKeyFiles(cliOptions.nomadTLSCertFilename.replaceAll(envReplacement, environment), cliOptions.nomadTLSKeyFilename.replaceAll(envReplacement, environment))
+        .build()
+      def nomadApiClient = new NomadApiClient(nomadConfig)
+
+      def jobsToTaskGroups = [:]
+      def taskGroupToAllocatedMHZ = [:]
+      def taskGroupToAllocatedMemory = [:]
+      def taskGroupToCount = [:]
+      def taskGroupToMeta = [:]
+      def jobsQueryStopwatch = new Stopwatch().start()
+
+      // get a list of all services in nomad
+      def services = nomadApiClient.getJobsApi().list().getValue().findAll { job ->
+        job.type == 'service'
+      }
+
+      def targetServices
+
+      if (cliOptions.targetJobs) {
+        targetServices = services.findAll { job -> cliOptions.targetJobs.contains(job.name) }
+      } else {
+        targetServices = services
+      }
+
+      targetServices.each { job ->
+
+        try {
+
+          nomadApiClient.getJobsApi().info(job.name).getValue().each { jobDetail ->
+            jobsToTaskGroups.put(job.name, [])
+
+            jobDetail.getTaskGroups().each { taskGroup ->
+
+              // compute the sum of all task group, tasks CPU resource definitions
+              def totalCPUResourcesForAllTasksInTaskGroup = taskGroup.tasks.collect { task ->
+                task.resources.cpu
+              }.sum()
+
+              // compute the sum of all task group, tasks CPU resource definitions
+              def totalMemoryResourcesForAllTasksInTaskGroup = taskGroup.tasks.collect { task ->
+                task.resources.memoryMb
+              }.sum()
+
+              taskGroupToCount.put(taskGroup.name, taskGroup.count)
+              taskGroupToMeta.put(taskGroup.name, new ContainerMeta(taskGroup.tasks.first().meta.get('slack_channel'), taskGroup.tasks.first().meta.get('team'), taskGroup.tasks.first().config.get('cpu_hard_limit')))
+              taskGroupToAllocatedMHZ.put(taskGroup.name, totalCPUResourcesForAllTasksInTaskGroup as Integer)
+              taskGroupToAllocatedMemory.put(taskGroup.name, totalMemoryResourcesForAllTasksInTaskGroup as Integer)
+              jobsToTaskGroups.get(job.name).add(taskGroup.name)
+            }
+          }
+        } catch (Exception e) {
+          printErr "An exception occurred; ${e}"
+        }
+      }
+
+      jobsQueryStopwatch.stop()
+      println "Finished building list of jobs and task groups for ${environment} in ${jobsQueryStopwatch.elapsed(TimeUnit.MILLISECONDS)} ms"
+
+      def nomadClientsQueryStopWatch = new Stopwatch().start()
+      def nomadClientsToCPUFrequency = [:]
+
+      // add clock frequencies for known nomad instances
+      nomadApiClient.getNodesApi().list().getValue().each { nomadClient ->
+        nomadApiClient.getNodesApi().info(nomadClient.id).getValue().each { nomad ->
+          nomadClientsToCPUFrequency.put(nomad.name, new BigDecimal(nomad.getAttributes().get('cpu.frequency')))
+        }
+      }
+
+      def averageKnownClientFrequency = nomadClientsToCPUFrequency.values().sum() / nomadClientsToCPUFrequency.values().size()
+
+      nomadClientsQueryStopWatch.stop()
+      println "Finished building list of nomad clients for ${environment} in ${nomadClientsQueryStopWatch.elapsed(TimeUnit.MILLISECONDS)} ms"
+
+      def slurper = new JsonSlurper()
+
+      // closure to open url, parse, and report back on stats
+      def slurpAndReport = { cpuTotalsURL, memoryTotalsURL, rangeSelectors ->
+
+        def cpuSumStats = new DescriptiveStatistics()
+        def memorySumStats = new DescriptiveStatistics()
+
+        def totalCPUResults = 0
+        def totalMemoryResults = 0
+        def missResults = 0
+
+        def cpuTotalsPrometheusURL = "${cpuTotalsURL}${rangeSelectors}"
+
+        try {
+
+          println "Opening connection to ${cpuTotalsPrometheusURL}"
+          def parsedCPUResponse = slurper.parse(cpuTotalsPrometheusURL.toURL())
+
+          parsedCPUResponse.data.result.each { result ->
+
+            result.values.each { value ->
+
+              totalCPUResults++
+
+              def snapshotCPUTotalPercent = new BigDecimal(value.last(), mathContext)
+              def snapshotCPUAsLoadAverage = snapshotCPUTotalPercent.movePointLeft(2)
+
+              if (nomadClientsToCPUFrequency.containsKey(result.metric.host)) {
+                cpuSumStats.addValue(snapshotCPUAsLoadAverage.multiply(nomadClientsToCPUFrequency.get(result.metric.host)).doubleValue())
+              } else if (cliOptions.avgKnownNomadClients) {
+                cpuSumStats.addValue(snapshotCPUAsLoadAverage.multiply(averageKnownClientFrequency).doubleValue())
+                missResults++
+              } else {
+                cpuSumStats.addValue(snapshotCPUAsLoadAverage.multiply(cliOptions.nomadFallbackClock).doubleValue())
+                missResults++
+              }
+            }
+          }
+
+          Thread.sleep(perTaskQuerySleepTime)
+
+        } catch (Exception exception) {
+
+          // usually this would be related to prometheus 500-ing because this is leaning against it too hard
+          println "Error occurred in opening, parsing, and processing results from prometheus for url ${cpuTotalsPrometheusURL}, exception: ${exception}"
+        }
+
+        def memTotalsPrometheusURL = "${memoryTotalsURL}${rangeSelectors}"
+
+        try {
+
+          println "Opening connection to ${memTotalsPrometheusURL}"
+          def parsedMemoryResponse = slurper.parse(memTotalsPrometheusURL.toURL())
+
+          parsedMemoryResponse.data.result.each { result ->
+
+            result.values.each { value ->
+
+              totalMemoryResults++
+
+              memorySumStats.addValue(Doubles.tryParse(value.last()) / 1000 / 1000)
+            }
+          }
+
+          Thread.sleep(perTaskQuerySleepTime)
+
+        } catch (Exception exception) {
+
+          // usually this would be related to prometheus 500-ing because this is leaning against it too hard
+          println "Error occurred in opening, parsing, and processing results from prometheus for url ${memTotalsPrometheusURL}, exception: ${exception}"
+        }
+
+        new StatsWithMissData(cpuSumStats, totalCPUResults, missResults, memorySumStats, totalMemoryResults)
+      }
+
+      // loop through each job, task group and query prometheus
+      jobsToTaskGroups.each { job, listOfTaskGroups ->
+
+        listOfTaskGroups.each { taskGroup ->
+
+          def prometheusTaskGroupQueryStopwatch = new Stopwatch().start()
+          def prometheusNomadClientCPUTotalPercentBaseURL = """${prometheusHost}/api/v1/query?query=avg_over_time(nomad_client_allocs_cpu_total_percent{task="${taskGroup}"}"""
+          def prometheusNomadClientMemoryUsageBaseURL = """${prometheusHost}/api/v1/query?query=avg_over_time(nomad_client_allocs_memory_usage{task="${taskGroup}"}"""
+
+          def meta = taskGroupToMeta.getOrDefault(taskGroup, new ContainerStats('-', '-', '-', '-','-'))
+
+          // offer data to the queue
+          queue.offer(new ContainerStats(environment,
+            meta.team,
+            job,
+            taskGroup,
+            meta.slackChannel,
+            meta.cpuHardLimit,
+            taskGroupToAllocatedMHZ.getOrDefault(taskGroup, 0),
+            taskGroupToAllocatedMemory.getOrDefault(taskGroup, 0),
+            taskGroupToCount.getOrDefault(taskGroup, 0),
+            cliOptions.disableOneHourQuery ? null : slurpAndReport(prometheusNomadClientCPUTotalPercentBaseURL, prometheusNomadClientMemoryUsageBaseURL, "[5s])[1h:5s]"),
+            cliOptions.disableOneDayQuery ? null : slurpAndReport(prometheusNomadClientCPUTotalPercentBaseURL, prometheusNomadClientMemoryUsageBaseURL, "[1m])[1d:1m]"),
+            cliOptions.disableSevenDayQuery ? null : slurpAndReport(prometheusNomadClientCPUTotalPercentBaseURL, prometheusNomadClientMemoryUsageBaseURL, "[1m])[7d:1m]"),
+            cliOptions.disableThirtyDayQuery ? null : slurpAndReport(prometheusNomadClientCPUTotalPercentBaseURL, prometheusNomadClientMemoryUsageBaseURL, "[1h])[30d:6h]"),
+            cliOptions.enableSixytDayQuery ? slurpAndReport(prometheusNomadClientCPUTotalPercentBaseURL, prometheusNomadClientMemoryUsageBaseURL, "[1h])[60d:12h]") : null,
+            cliOptions.enableNinetyDayQuery ? slurpAndReport(prometheusNomadClientCPUTotalPercentBaseURL, prometheusNomadClientMemoryUsageBaseURL, "[1h])[90d:24h]") : null))
+
+          prometheusTaskGroupQueryStopwatch.stop()
+          println "Finished querying prometheus for ${environment}, job ${job} and task group ${taskGroup} in ${prometheusTaskGroupQueryStopwatch.elapsed(TimeUnit.MILLISECONDS)} ms"
+
+          Thread.sleep(perTaskSleepTime)
+        }
+      }
+
+      nomadApiClient.close()
+
+      perEnvironmentStopwatch.stop()
+      println "Finished building data for ${environment} in ${perEnvironmentStopwatch.elapsed(TimeUnit.SECONDS)} seconds"
+
+    } catch (Exception e) {
+      printErr "An exception occurred; ${e}"
+    } finally {
+      latch.countDown()
+    }
+  }
+}
+
+// create the sheets and headers
+envs.each { environment ->
+
+  def sheet = workbook.createSheet(environment)
+  def headerRow = sheet.createRow(0)
+
+  headerValues.eachWithIndex { headerValue, index ->
+    def cell = headerRow.createCell(index)
+    cell.setCellValue(headerValue)
+    cell.setCellStyle(headerCellStyle)
+  }
+}
+
+// this is effectively latch.await()
+while (latch.count > 0L) {
+
+  // keep the loop from running crazy out of control while the environment processing threads spin up
+  def containerStats = queue.poll()
+
+  if (containerStats) {
+
+    def sheet = workbook.getSheet(containerStats.environment)
+
+    def row = sheet.createRow(sheet.lastRowNum + 1)
+    row.createCell(0).setCellValue(containerStats.team)
+    row.createCell(1).setCellValue(containerStats.job)
+    row.createCell(2).setCellValue(containerStats.taskGroup)
+    row.createCell(3).setCellValue(containerStats.slackChannel)
+    row.createCell(4).setCellValue(containerStats.cpuHardLimit ? 'true' : 'false')
+    row.createCell(5).setCellValue(containerStats.allocatedMHz)
+    row.createCell(6).setCellValue(containerStats.allocatedMemory)
+    row.createCell(7).setCellValue(containerStats.count)
+
+    if (containerStats.hourStats) addValuesToRow(row, containerStats.allocatedMHz, containerStats.hourStats, containerStats.allocatedMemory)
+    if (containerStats.dayStats) addValuesToRow(row, containerStats.allocatedMHz, containerStats.dayStats, containerStats.allocatedMemory)
+    if (containerStats.weekStats) addValuesToRow(row, containerStats.allocatedMHz, containerStats.weekStats, containerStats.allocatedMemory)
+    if (containerStats.monthStats) addValuesToRow(row, containerStats.allocatedMHz, containerStats.monthStats, containerStats.allocatedMemory)
+    if (containerStats.sixyDayStats) addValuesToRow(row, containerStats.allocatedMHz, containerStats.sixyDayStats, containerStats.allocatedMemory)
+    if (containerStats.quarterYearStats) addValuesToRow(row, containerStats.allocatedMHz, containerStats.quarterYearStats, containerStats.allocatedMemory)
+  }
+}
+
+// reize columns
+envs.each { environment ->
+  def sheet = workbook.getSheet(environment)
+  sheet.getRow(0).getLastCellNum().times { number ->
+    sheet.autoSizeColumn(number)
+  }
+}
+
+// write the workbook to a file
+new File("container_env_snapshot_as_of-${startTime.format(DateTimeFormatter.ISO_LOCAL_DATE_TIME)}.xlsx").withOutputStream { stream ->
+  workbook.write(stream)
+}
+
+workbook.close()
+
+totalTimeStopwatch.stop()
+println "Finished job in ${totalTimeStopwatch.elapsed(TimeUnit.SECONDS)} seconds"
